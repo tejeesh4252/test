@@ -1,0 +1,1668 @@
+"""
+EOD Mail Dispatcher — v4.1
+Multi-Group EOD Status Mailer with GUI File Selector
+Optimised: Lazy win32com, Splash Screen (fixed), Fast Startup
+Author  : DomusAI x Tej
+"""
+
+import os
+import csv
+import traceback
+import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+# ✅ pandas, webbrowser, tempfile loaded lazily — keeps startup fast
+# ✅ win32com is NOT imported at top — loaded lazily only when Send is clicked
+
+# ========================== CONFIGURATION ==========================
+
+EMAIL_SUBJECT = "Daily EOD Status"
+CONFIG_SHEET  = "Config"
+
+LOG_FILE_PATH = os.path.join(
+    os.path.expanduser("~"), "Desktop",
+    "EOD_Dispatcher_Log.csv"
+)
+
+# ── Alter Domus Brand Colours ──────────────────────────────────────
+AD_BLUE   = "#003865"
+AD_LIGHT  = "#e8f0f7"
+AD_ACCENT = "#0072CE"
+AD_GREEN  = "#28a745"
+AD_YELLOW = "#e6a817"
+AD_RED    = "#dc3545"
+AD_GREY   = "#6c757d"
+AD_WHITE  = "#ffffff"
+
+# ── Runtime GROUPS — populated by read_config() ───────────────────
+GROUPS = {}
+
+
+# ========================== LOGGING ================================
+
+def log_message(msg):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+
+def write_audit_log(group, sent_date, sent_by=""):
+    file_exists = os.path.isfile(LOG_FILE_PATH)
+    try:
+        with open(LOG_FILE_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["Timestamp", "SentBy", "Group",
+                                 "SentDate", "Status"])
+            writer.writerow([
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                sent_by, group, sent_date, "Sent"
+            ])
+    except Exception as e:
+        log_message(f"WARNING: Could not write audit log — {e}")
+
+
+def already_sent_today(group):
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    if not os.path.isfile(LOG_FILE_PATH):
+        return False
+    try:
+        with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if (row.get("Group",    "") == group and
+                        row.get("SentDate", "").startswith(today_str) and
+                        row.get("Status",   "") == "Sent"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+# ========================== FILE ACCESS CHECK ======================
+
+def check_file_accessible(path):
+    try:
+        with open(path, "rb"):
+            pass
+        return True, ""
+    except PermissionError:
+        return False, (
+            "Permission denied — the file may be:\n\n"
+            "  • Open in Excel (please close it first)\n"
+            "  • Locked by OneDrive sync (wait a moment)\n\n"
+            f"File: {os.path.basename(path)}"
+        )
+    except Exception as e:
+        return False, str(e)
+
+
+# ========================== CONFIG READER ==========================
+
+def read_config(excel_path):
+    """
+    Read the 'Config' sheet and build:
+      GROUPS  dict  — { group: {sheet, subject, title, subtitle} }
+      recipients    — { group: {to: [...], cc: [...]} }
+
+    Config columns: GROUP | Sheet | Title | Funds | Subject | Role | Email | Active
+    """
+    global GROUPS
+    groups_cfg = {}
+    recipients = {}
+    errors     = []
+    import pandas as pd  # ✅ ADD THIS LINE — lazy import
+
+    try:
+        df = pd.read_excel(excel_path, sheet_name=CONFIG_SHEET, dtype=str,engine = "openpyxl")
+        df.columns = [str(c).strip() for c in df.columns]
+        df.fillna("", inplace=True)
+
+        for _, row in df.iterrows():
+            grp      = str(row.get("GROUP",   "")).strip()
+            sheet    = str(row.get("Sheet",   "")).strip()
+            title    = str(row.get("Title",   "")).strip()
+            subtitle = str(row.get("Funds",   "")).strip()
+            subject  = str(row.get("Subject", "")).strip()
+            role     = str(row.get("Role",    "")).strip().upper()
+            email    = str(row.get("Email",   "")).strip()
+            active   = str(row.get("Active",  "")).strip().lower()
+
+            if not grp or grp.lower() in ("nan", "none"):
+                continue
+
+            if grp not in groups_cfg:
+                row_errors = []
+                if not title    or title    in ("nan", "none"): row_errors.append("Title")
+                if not subtitle or subtitle in ("nan", "none"): row_errors.append("SubTitle")
+                if not subject  or subject  in ("nan", "none"): row_errors.append("Subject")
+                if not sheet    or sheet    in ("nan", "none"): row_errors.append("Sheet")
+                if row_errors:
+                    errors.append(
+                        f"[{grp}] Missing config fields: "
+                        + ", ".join(row_errors)
+                    )
+                    continue
+
+                groups_cfg[grp] = {
+                    "sheet"    : sheet,
+                    "subject"  : subject,
+                    "title"    : title,
+                    "subtitle" : subtitle,
+                }
+                recipients[grp] = {"to": [], "cc": []}
+
+            if active not in ("yes", "y", "true", "1"):
+                continue
+            if "@" not in email:
+                continue
+            parts = email.split()
+            email = next((p for p in parts if "@" in p), email)
+
+            if role == "TO":
+                recipients[grp]["to"].append(email)
+            elif role == "CC":
+                recipients[grp]["cc"].append(email)
+
+    except Exception as e:
+        log_message(f"ERROR reading Config: {e}")
+        log_message(traceback.format_exc())
+        return False, f"❌  Failed to read Config sheet:\n\n{e}", {}, {}
+
+    if errors:
+        return False, (
+            "❌  Config sheet has errors:\n\n"
+            + "\n".join(f"  • {e}" for e in errors)
+            + "\n\nPlease fix and reload."
+        ), {}, {}
+
+    if not groups_cfg:
+        return False, (
+            "❌  No valid groups found in Config sheet.\n\n"
+            "Please check the Config sheet has data and Active = Yes."
+        ), {}, {}
+
+    GROUPS = groups_cfg
+    log_message(f"Config loaded — Groups: {list(GROUPS.keys())}")
+
+    try:
+        xl = pd.ExcelFile(excel_path, engine="openpyxl")
+        sheet_names = xl.sheet_names
+        missing     = []
+        for grp, cfg in groups_cfg.items():
+            if cfg["sheet"] not in sheet_names:
+                missing.append(
+                    f"  • Group '{grp}' → Sheet '{cfg['sheet']}' "
+                    f"not found.\n    Available: {', '.join(sheet_names)}"
+                )
+        if missing:
+            return False, (
+                "❌  Sheet name mismatch:\n\n"
+                + "\n".join(missing)
+                + "\n\nCheck GROUP name matches tab name exactly."
+            ), {}, {}
+    except Exception as e:
+        log_message(f"WARNING: Could not validate sheet names — {e}")
+
+    return True, "", groups_cfg, recipients
+
+
+# ========================== DATA READER ============================
+
+def read_group_data(excel_path, group_key):
+    import pandas as pd                              # ✅ ADD — lazy import
+    cfg        = GROUPS[group_key]
+    sheet_name = cfg["sheet"]
+    today      = datetime.date.today()
+
+    try:
+        xl = pd.ExcelFile(excel_path, engine="openpyxl")   # ✅ ADD engine=
+        if sheet_name not in xl.sheet_names:
+            return None, f"Sheet '{sheet_name}' not found in file."
+
+        df = xl.parse(sheet_name)                           # ✅ reuse xl — don't re-open
+
+        cleaned_cols = []
+        for c in df.columns:
+            c_str = str(c).strip()
+            if c_str.lower().startswith("unnamed"):
+                c_str = ""
+            cleaned_cols.append(c_str)
+        df.columns = cleaned_cols
+        df = df.loc[:, df.columns != ""]
+
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower().strip()
+            if   "date"     in cl:                      col_map[col] = "Date"
+            elif "task"     in cl or "activity" in cl:  col_map[col] = "Task"
+            elif "preparer" in cl:                      col_map[col] = "Preparer"
+            elif "comment"  in cl:                      col_map[col] = "Comments"
+            elif "status"   in cl:                      col_map[col] = "Status"
+            elif "fund"     in cl:                      col_map[col] = "Fund"
+            elif "client"   in cl:                      col_map[col] = "Client"
+        df.rename(columns=col_map, inplace=True)
+
+        if "Date" not in df.columns:
+            return None, "No 'Date' column found in sheet."
+
+        raw_dates = df["Date"].dropna().unique()[:5]
+        log_message(f"[{group_key}] Sample raw dates: {list(raw_dates)}")
+
+        df["_parsed_date"] = df["Date"].apply(to_python_date)
+        log_message(f"[{group_key}] Looking for today: {today}")
+
+        today_df = df[df["_parsed_date"] == today].copy()
+        today_df.drop(columns=["_parsed_date"], inplace=True)
+
+        if today_df.empty:
+            recent = sorted(
+                [d for d in df["_parsed_date"].dropna().unique()
+                 if d is not None],
+                reverse=True
+            )[:5]
+            log_message(f"[{group_key}] No rows for today. "
+                        f"Most recent: {recent}")
+            return pd.DataFrame(), (
+                f"No records for {today.strftime('%d %b %Y')}. "
+                f"Latest: {recent[0] if recent else 'unknown'}"
+            )
+
+        log_message(f"[{group_key}] {len(today_df)} rows found.")
+        return today_df, None
+
+    except Exception as e:
+        log_message(f"[{group_key}] ERROR in read_group_data: {e}")
+        log_message(traceback.format_exc())
+        return None, str(e)
+
+
+# ========================== DATE UTILS =============================
+
+def to_python_date(val):
+    import pandas as pd   # ✅ lazy import — was missing, causing NameError
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    if isinstance(val, datetime.datetime):
+        return val.date()
+    if isinstance(val, datetime.date):
+        return val
+    s = str(val).strip()
+    if s.lower() in ("", "nan", "nat", "none"):
+        return None
+    try:
+        serial = int(float(s))
+        if 40000 < serial < 110000:
+            return (datetime.date(1899, 12, 30)
+                    + datetime.timedelta(days=serial))
+    except Exception:
+        pass
+    if " " in s:
+        s = s.split(" ")[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+                "%d-%b-%Y", "%d-%b-%y", "%d %b %Y", "%d %b %y",
+                "%b %d, %Y", "%d/%m/%y", "%m/%d/%y", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    log_message(f"WARNING: Could not parse date value: '{val}'")
+    return None
+
+
+# ========================== STATUS BADGE ===========================
+
+STATUS_COLOR = {
+    "completed"                                 : AD_GREEN,
+    "sent to onshore"                           : AD_GREEN,
+    "sent for review"                           : AD_GREEN,
+    "shared to onshore"                         : AD_GREEN,
+    "shared to client"                          : AD_GREEN,
+    "sent to client"                            : AD_GREEN,
+    "uploaded"                                  : AD_GREEN,
+    "posted"                                    : AD_GREEN,
+    "onshore review completed"                  : AD_GREEN,
+    "upto date"                                 : AD_GREEN,
+    "sent to elvira"                            : AD_GREEN,
+    "sent to sara"                              : AD_GREEN,
+    "re-shared to onshore"                      : AD_GREEN,
+    "completed "                                : AD_GREEN,
+    "posted "                                   : AD_GREEN,
+    "wip"                                       : AD_YELLOW,
+    "in progress"                               : AD_YELLOW,
+    "inprogress"                                : AD_YELLOW,
+    "under internal review"                     : AD_YELLOW,
+    "internal review"                           : AD_YELLOW,
+    "awaiting approval"                         : AD_YELLOW,
+    "awaiting"                                  : AD_YELLOW,
+    "under review"                              : AD_YELLOW,
+    "working on updates"                        : AD_YELLOW,
+    "wip-shared to onshore via teams"           : AD_YELLOW,
+    "wip- internal review"                      : AD_YELLOW,
+    "sent for approval"                         : AD_YELLOW,
+    "awaiting for approval"                     : AD_YELLOW,
+    "partially completed- waiting for approval" : AD_YELLOW,
+    "awaiting for final approval"               : AD_YELLOW,
+    "yet to start"                              : AD_YELLOW,
+    "needs to start"                            : AD_YELLOW,
+    "updated"                                   : AD_YELLOW,
+    "pending"                                   : AD_RED,
+    "on hold"                                   : AD_RED,
+    "blocked"                                   : AD_RED,
+    "no activity"                               : AD_GREY,
+    "no cash activity"                          : AD_GREY,
+    "—"                                         : AD_GREY,
+}
+
+
+def status_badge(status):
+    s = str(status).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return "<span style='color:#999;'>—</span>"
+    color = STATUS_COLOR.get(s.lower(), AD_ACCENT)
+    return (f"<span style='background:{color};color:#fff;"
+            f"padding:2px 9px;border-radius:10px;"
+            f"font-size:11px;font-weight:600;white-space:nowrap;'>"
+            f"{s}</span>")
+
+
+# ========================== REFERENCE PATHS HTML ===================
+
+def build_paths_section(paths):
+    if not paths:
+        return ""
+    rows = "".join(
+        f"<tr><td style='padding:5px 0;'>"
+        f"<span style='font-family:Consolas,monospace;font-size:12px;"
+        f"color:{AD_BLUE};'>📁</span>"
+        f"&nbsp;<span style='font-family:Consolas,monospace;"
+        f"font-size:12px;color:#333;word-break:break-all;'>{p}</span>"
+        f"</td></tr>"
+        for p in paths
+    )
+    return f"""
+  <!-- REFERENCE PATHS -->
+  <tr>
+    <td style='padding:0 30px 24px;'>
+      <table width='100%' cellpadding='0' cellspacing='0'
+             style='border-top:2px solid {AD_BLUE};margin-top:4px;'>
+        <tr>
+          <td style='padding:12px 0 8px;'>
+            <h3 style='margin:0;color:{AD_BLUE};font-size:13px;
+                font-weight:700;text-transform:uppercase;
+                letter-spacing:.5px;'>
+              📁&nbsp; Reference Paths</h3>
+          </td>
+        </tr>
+        {rows}
+      </table>
+    </td>
+  </tr>"""
+
+
+# ========================== QUESTIONS / COMMENTS ====================
+
+def build_questions_section(text):
+    if not text or not text.strip():
+        return ""
+    safe = (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\n", "<br>"))
+    return f"""
+  <!-- QUESTIONS / COMMENTS TO ONSHORE-CLIENT -->
+  <tr>
+    <td style='padding:0 30px 24px;'>
+      <table width='100%' cellpadding='0' cellspacing='0'
+             style='background:#fff7e6;border:1px solid {AD_YELLOW};
+             border-radius:6px;'>
+        <tr>
+          <td style='padding:12px 16px;'>
+            <h3 style='margin:0 0 6px;color:#8a5a00;font-size:13px;
+                font-weight:700;text-transform:uppercase;
+                letter-spacing:.5px;'>
+              ❓&nbsp; Questions / Comments to Onshore &amp; Client</h3>
+            <p style='margin:0;color:#5a3d00;font-size:12px;
+               line-height:1.5;'>{safe}</p>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>"""
+
+
+# ========================== RECIPIENT BANNER =======================
+
+def build_recipient_banner(to_list, cc_list):
+    def pill(addr):
+        return (f"<span style='display:inline-block;"
+                f"background:#e8f0f7;color:#003865;"
+                f"border:1px solid #c2d4e8;"
+                f"border-radius:12px;padding:3px 10px;"
+                f"font-size:11px;margin:2px 4px 2px 0;"
+                f"font-family:Consolas,monospace;'>"
+                f"{addr}</span>")
+
+    to_pills = "".join(pill(a) for a in to_list) if to_list else \
+               "<span style='color:#999;font-style:italic;" \
+               "font-size:11px;'>None configured</span>"
+    cc_pills = "".join(pill(a) for a in cc_list) if cc_list else \
+               "<span style='color:#999;font-style:italic;" \
+               "font-size:11px;'>None</span>"
+
+    return f"""
+  <!-- RECIPIENT PREVIEW BANNER -->
+  <tr>
+    <td style='background:#f7f9fc;border:2px dashed #c2d4e8;
+               padding:14px 30px;'>
+      <table width='100%' cellpadding='0' cellspacing='0'>
+        <tr>
+          <td width='30' style='vertical-align:top;padding-top:4px;'>
+            <span style='font-size:16px;'>📧</span>
+          </td>
+          <td>
+            <p style='margin:0 0 4px;font-size:10px;font-weight:700;
+               color:#003865;letter-spacing:1px;
+               text-transform:uppercase;'>
+              Preview — This email will be sent to:</p>
+            <table cellpadding='0' cellspacing='0'
+                   style='width:100%;margin-top:6px;'>
+              <tr>
+                <td style='width:28px;vertical-align:top;
+                    padding-top:5px;'>
+                  <span style='background:#003865;color:#fff;
+                    font-size:9px;font-weight:700;padding:2px 5px;
+                    border-radius:4px;'>TO</span>
+                </td>
+                <td style='padding-left:6px;'>{to_pills}</td>
+              </tr>
+              <tr><td colspan='2' style='height:6px;'></td></tr>
+              <tr>
+                <td style='width:28px;vertical-align:top;
+                    padding-top:5px;'>
+                  <span style='background:#0072CE;color:#fff;
+                    font-size:9px;font-weight:700;padding:2px 5px;
+                    border-radius:4px;'>CC</span>
+                </td>
+                <td style='padding-left:6px;'>{cc_pills}</td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>"""
+
+
+# ========================== BUILD HTML =============================
+
+def build_html(today, df, group_key,
+               to_list=None, cc_list=None, ref_paths=None,
+               questions=None):
+    cfg          = GROUPS[group_key]
+    display_date = today.strftime("%d %b %Y")
+    to_list      = to_list  or []
+    cc_list      = cc_list  or []
+    ref_paths    = ref_paths or []
+    questions    = questions or ""
+
+    # ── Stats ──────────────────────────────────────────────────────
+    # ✅ FIX: no activity rows excluded — don't inflate pending count
+    NO_ACTIVITY_KEYS = ["no activity", "no cash activity", "—"]
+
+    total     = len(df)
+    completed = sum(1 for s in df["Status"].astype(str)
+                    if any(k in s.lower() for k in
+                           ["completed", "sent to onshore",
+                            "sent for review", "shared to onshore",
+                            "uploaded", "posted",
+                            "onshore review completed", "upto date",
+                            "sent to client"]))
+    in_prog   = sum(1 for s in df["Status"].astype(str)
+                    if any(k in s.lower() for k in
+                           ["wip", "in progress", "inprogress",
+                            "internal review", "awaiting"]))
+    no_act    = sum(1 for s in df["Status"].astype(str)
+                    if any(k in s.strip().lower()
+                           for k in NO_ACTIVITY_KEYS))
+    pending   = total - completed - in_prog - no_act  # ✅ fixed
+
+    # ── Group rows by Client ───────────────────────────────────────
+    client_groups = {}
+    for _, row in df.iterrows():
+        c = str(row.get("Client", "")).strip()
+        if not c or c.lower() in ("nan", "none", ""):
+            c = group_key
+        client_groups.setdefault(c, []).append(row)
+
+    # ── Build table rows ───────────────────────────────────────────
+    rows_html = ""
+    row_num   = 0
+    for client, c_rows in client_groups.items():
+        first = True
+        for row in c_rows:
+            row_num += 1
+            bg       = AD_WHITE if row_num % 2 == 0 else AD_LIGHT
+            fund     = str(row.get("Fund",     "")).strip()
+            task     = str(row.get("Task",     "")).strip()
+            status   = str(row.get("Status",   "")).strip()
+            comments = str(row.get("Comments", "")).strip()
+            preparer = str(row.get("Preparer", "")).strip()
+
+            if comments.lower() in ("nan", "none", ""): comments = "—"
+            if preparer.lower() in ("nan", "none", ""): preparer = "—"
+
+            cc = ""
+            if first:
+                cc = (f"<td rowspan='{len(c_rows)}' "
+                      f"style='padding:8px 10px;vertical-align:middle;"
+                      f"font-weight:700;background:{AD_LIGHT};"
+                      f"border-right:3px solid {AD_BLUE};"
+                      f"color:{AD_BLUE};font-size:12px;'>{client}</td>")
+                first = False
+
+            rows_html += f"""
+            <tr style='background:{bg};border-bottom:1px solid #e0e0e0;'>
+              {cc}
+              <td style='padding:7px 10px;font-size:12px;color:#333;'>
+                {fund}</td>
+              <td style='padding:7px 10px;font-size:12px;color:#333;'>
+                {task}</td>
+              <td style='padding:7px 10px;text-align:center;'>
+                {status_badge(status)}</td>
+              <td style='padding:7px 10px;font-size:11px;color:#555;'>
+                {comments}</td>
+              <td style='padding:7px 10px;font-size:11px;color:#003865;
+                font-weight:600;text-align:center;'>{preparer}</td>
+            </tr>"""
+
+    if not rows_html:
+        rows_html = (
+            f"<tr><td colspan='6' style='text-align:center;"
+            f"padding:24px;color:{AD_GREY};font-style:italic;'>"
+            f"No activity recorded for today.</td></tr>"
+        )
+
+    recipient_banner = (
+        build_recipient_banner(to_list, cc_list)
+        if (to_list or cc_list) else ""
+    )
+    paths_section     = build_paths_section(ref_paths)
+    questions_section = build_questions_section(questions)
+
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'></head>
+<body style='margin:0;padding:0;font-family:Calibri,Arial,sans-serif;
+background:#f0f4f8;'>
+<table width='100%' cellpadding='0' cellspacing='0'
+       style='background:#f0f4f8;padding:24px 0;'>
+<tr><td align='center'>
+<table width='820' cellpadding='0' cellspacing='0'
+       style='background:{AD_WHITE};border-radius:10px;
+       box-shadow:0 3px 12px rgba(0,0,0,0.12);overflow:hidden;'>
+  <tr>
+    <td style='background:{AD_BLUE};padding:24px 30px;'>
+      <table width='100%' cellpadding='0' cellspacing='0'><tr>
+        <td>
+          <p style='margin:0;color:{AD_WHITE};font-size:10px;
+             letter-spacing:2px;text-transform:uppercase;opacity:.7;'>
+            End of Day Status Report</p>
+          <h1 style='margin:5px 0 2px;color:{AD_WHITE};font-size:22px;
+              font-weight:700;'>{cfg["title"]}</h1>
+          <p style='margin:0;color:{AD_WHITE};font-size:12px;opacity:.7;'>
+            {cfg["subtitle"]}</p>
+        </td>
+        <td align='right' style='vertical-align:top;'>
+          <p style='margin:0;color:{AD_WHITE};font-size:15px;
+             font-weight:600;opacity:.9;'>{display_date}</p>
+          <p style='margin:4px 0 0;color:{AD_WHITE};font-size:11px;
+             opacity:.65;'>Alter Domus</p>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
+
+  {recipient_banner}
+
+  <!-- STATS BAR -->
+  <tr>
+    <td style='background:{AD_BLUE};padding:14px 30px;opacity:.85;'>
+      <table width='100%' cellpadding='0' cellspacing='0'><tr>
+        <td align='center'>
+          <span style='color:#90ee90;font-size:22px;font-weight:700;'>
+            {completed}</span><br>
+          <span style='color:{AD_WHITE};font-size:10px;opacity:.8;'>
+            COMPLETED</span>
+        </td>
+        <td style='border-left:1px solid rgba(255,255,255,0.3);'
+            align='center'>
+          <span style='color:#ffe08a;font-size:22px;font-weight:700;'>
+            {in_prog}</span><br>
+          <span style='color:{AD_WHITE};font-size:10px;opacity:.8;'>
+            IN PROGRESS</span>
+        </td>
+        <td style='border-left:1px solid rgba(255,255,255,0.3);'
+            align='center'>
+          <span style='color:#ffaaaa;font-size:22px;font-weight:700;'>
+            {pending}</span><br>
+          <span style='color:{AD_WHITE};font-size:10px;opacity:.8;'>
+            PENDING / ON HOLD</span>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
+
+  <!-- ACTIVITY TABLE -->
+  <tr>
+    <td style='padding:26px 30px;'>
+      <h2 style='margin:0 0 14px;color:{AD_BLUE};font-size:14px;
+          font-weight:700;text-transform:uppercase;letter-spacing:.5px;
+          border-bottom:2px solid {AD_BLUE};padding-bottom:6px;'>
+        Today's Activity Log</h2>
+      <table width='100%' cellpadding='0' cellspacing='0'
+             style='border-collapse:collapse;font-size:13px;
+             border:1px solid #dde3ea;'>
+        <thead>
+          <tr style='background:{AD_BLUE};color:{AD_WHITE};'>
+            <th style='padding:10px;text-align:left;width:12%;'>
+              Client</th>
+            <th style='padding:10px;text-align:left;width:14%;'>
+              Fund</th>
+            <th style='padding:10px;text-align:left;width:24%;'>
+              Task / Activity</th>
+            <th style='padding:10px;text-align:center;width:16%;'>
+              Status</th>
+            <th style='padding:10px;text-align:left;width:22%;'>
+              Comments</th>
+            <th style='padding:10px;text-align:center;width:12%;'>
+              Preparer</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+
+      <!-- LEGEND -->
+      <table cellpadding='0' cellspacing='0' style='margin-top:12px;'>
+        <tr>
+          <td style='font-size:11px;color:{AD_GREY};padding-right:8px;
+              font-style:italic;'>Legend:</td>
+          <td style='padding-right:12px;'>
+            <span style='background:{AD_GREEN};color:#fff;
+            padding:2px 8px;border-radius:8px;font-size:10px;'>
+              ✔ Completed / Sent</span></td>
+          <td style='padding-right:12px;'>
+            <span style='background:{AD_YELLOW};color:#fff;
+            padding:2px 8px;border-radius:8px;font-size:10px;'>
+              ⏳ WIP / In Progress</span></td>
+          <td style='padding-right:12px;'>
+            <span style='background:{AD_RED};color:#fff;
+            padding:2px 8px;border-radius:8px;font-size:10px;'>
+              ⚠ Pending / On Hold</span></td>
+          <td>
+            <span style='background:{AD_GREY};color:#fff;
+            padding:2px 8px;border-radius:8px;font-size:10px;'>
+              — No Activity</span></td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  {questions_section}
+
+  {paths_section}
+
+  <!-- FOOTER -->
+  <tr>
+    <td style='background:{AD_BLUE};padding:14px 30px;'>
+      <p style='margin:0;color:{AD_WHITE};font-size:11px;
+         opacity:.65;text-align:center;'>
+        Alter Domus &nbsp;·&nbsp; {display_date}
+      </p>
+    </td>
+  </tr>
+
+</table>
+</td></tr></table>
+</body></html>"""
+
+
+# ========================== BUILD NO-DATA HTML =====================
+
+def build_no_data_html(today, group_key,
+                       to_list=None, cc_list=None, ref_paths=None,
+                       questions=None):
+    cfg          = GROUPS[group_key]
+    display_date = today.strftime("%d %b %Y")
+    to_list      = to_list  or []
+    cc_list      = cc_list  or []
+    ref_paths    = ref_paths or []
+    questions    = questions or ""
+
+    recipient_banner = (
+        build_recipient_banner(to_list, cc_list)
+        if (to_list or cc_list) else ""
+    )
+    paths_section     = build_paths_section(ref_paths)
+    questions_section = build_questions_section(questions)
+
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'></head>
+<body style='margin:0;padding:0;font-family:Calibri,Arial,sans-serif;
+background:#f0f4f8;'>
+<table width='100%' cellpadding='0' cellspacing='0'
+       style='background:#f0f4f8;padding:24px 0;'>
+<tr><td align='center'>
+<table width='820' cellpadding='0' cellspacing='0'
+       style='background:{AD_WHITE};border-radius:10px;
+       box-shadow:0 3px 12px rgba(0,0,0,0.12);overflow:hidden;'>
+
+  <!-- HEADER -->
+  <tr>
+    <td style='background:{AD_BLUE};padding:24px 30px;'>
+      <table width='100%' cellpadding='0' cellspacing='0'><tr>
+        <td>
+          <p style='margin:0;color:{AD_WHITE};font-size:10px;
+             letter-spacing:2px;text-transform:uppercase;opacity:.7;'>
+            End of Day Status Report</p>
+          <h1 style='margin:5px 0 2px;color:{AD_WHITE};font-size:22px;
+              font-weight:700;'>{cfg["title"]}</h1>
+          <p style='margin:0;color:{AD_WHITE};font-size:12px;opacity:.7;'>
+            {cfg["subtitle"]}</p>
+        </td>
+        <td align='right' style='vertical-align:top;'>
+          <p style='margin:0;color:{AD_WHITE};font-size:15px;
+             font-weight:600;opacity:.9;'>{display_date}</p>
+          <p style='margin:4px 0 0;color:{AD_WHITE};font-size:11px;
+             opacity:.65;'>Alter Domus</p>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
+
+  {recipient_banner}
+
+  <tr>
+    <td style='padding:30px;text-align:center;'>
+      <p style='font-size:15px;color:{AD_GREY};font-style:italic;'>
+        No activity or tasks pending from our side as on 
+        <strong>{display_date}</strong>.
+      </p>
+    </td>
+  </tr>
+
+  {questions_section}
+
+  {paths_section}
+
+  <tr>
+    <td style='background:{AD_BLUE};padding:14px 30px;'>
+      <p style='margin:0;color:{AD_WHITE};font-size:11px;
+         opacity:.65;text-align:center;'>
+        Alter Domus &nbsp;·&nbsp; {display_date}
+      </p>
+    </td>
+  </tr>
+</table>
+</td></tr></table>
+</body></html>"""
+
+
+# ========================== SEND EMAIL =============================
+
+def send_outlook_email(html_body, group_key, today,
+                       to_list, cc_list,
+                       attachments=None, ref_paths=None,
+                       is_no_activity=False):
+    """
+    ✅ win32com loaded lazily — only imported when Send is clicked.
+    This keeps startup fast.
+    """
+    import win32com.client as win32   # ✅ LAZY IMPORT
+
+    attachments = attachments or []
+    subject = (f"{EMAIL_SUBJECT} | "
+               f"{GROUPS[group_key]['subject']} | "
+               f"{'No Activity | ' if is_no_activity else ''}"
+               f"{today.strftime('%d %b %Y')}")
+
+    outlook = win32.Dispatch("outlook.application")
+    mail    = outlook.CreateItem(0)
+    mail.Subject  = subject
+    mail.HTMLBody = html_body
+
+    for addr in to_list:
+        r        = mail.Recipients.Add(addr)
+        r.Type   = 1   # ✅ olTo — explicitly set
+        r.Resolve()    # ✅ Force Outlook to resolve the address
+
+    for addr in cc_list:
+        r        = mail.Recipients.Add(addr)
+        r.Type   = 2   # olCC
+        r.Resolve()    # ✅ FIX — was missing, causing CC to be dropped
+
+    for fp in attachments:
+        mail.Attachments.Add(Source=fp)
+        log_message(f"[{group_key}] 📎 Attached: {os.path.basename(fp)}")
+
+    mail.Send()
+    log_message(f"[{group_key}] ✅ Email sent — "
+                f"TO: {len(to_list)}  CC: {len(cc_list)}  "
+                f"Attachments: {len(attachments)}")
+
+
+# ========================== GUI ====================================
+
+class EODDispatcherApp:
+    BG        = "#f5f6fa"
+    PANEL_BG  = "#ffffff"
+    HEADER_BG = "#003865"
+    HEADER_FG = "#ffffff"
+    BTN_SEND    = "#E83A2C"
+    BTN_PREVIEW = "#0072CE"
+    BTN_BROWSE  = "#0072CE"
+    BTN_ATTACH  = "#0072CE"
+    TEXT_DARK = "#1a1a2e"
+    TEXT_MID  = "#444444"
+    GREEN  = "#28a745"
+    YELLOW = "#e6a817"
+    RED    = "#dc3545"
+    GREY   = "#6c757d"
+    ACCENT = "#0072CE"
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("EOD Mail Dispatcher  —  v4.1")
+        self.root.resizable(True, True)
+        self.root.configure(bg=self.BG)
+        self.root.attributes("-topmost", True)
+        self.root.state("zoomed")
+        self.root.minsize(900, 600)
+
+        self.file_path         = tk.StringVar()
+        self.group_vars        = {}
+        self.status_labels     = {}
+        self.preview_btns      = {}
+        self.attachment_paths  = {}
+        self.attachment_labels = {}
+        self.path_texts        = {}
+        self.question_texts    = {}
+
+        # ✅ No-activity confirmation gate — a group with zero rows
+        # today can never be sent until a human explicitly ticks this.
+        self.no_activity_confirmed = {}
+        self.no_activity_cbs       = {}
+        self.no_activity_rows      = {}
+        self.group_checkbuttons    = {}
+
+        self.root.after(10, self._deferred_start)
+
+    def _deferred_start(self):
+        """Builds UI after event loop starts — keeps splash responsive."""
+        self._build_ui()
+        self._center_window()
+
+    # ── UI BUILD ──────────────────────────────────────────────────
+
+    def _build_ui(self):
+        hdr = tk.Frame(self.root, bg=self.HEADER_BG, pady=14)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="EOD Mail Dispatcher",
+                 bg=self.HEADER_BG, fg=self.HEADER_FG,
+                 font=("Calibri", 18, "bold")).pack()
+        tk.Label(hdr, text="Alter Domus  ·  v4.1",
+                 bg=self.HEADER_BG, fg="#c8dff0",
+                 font=("Calibri", 9)).pack()
+
+        outer = tk.Frame(self.root, bg=self.BG)
+        outer.pack(fill="both", expand=True)
+
+        canvas    = tk.Canvas(outer, bg=self.BG,
+                              highlightthickness=0, width=700)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical",
+                                  command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body   = tk.Frame(canvas, bg=self.BG, padx=20, pady=14)
+        win_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_resize(e):
+            canvas.itemconfig(win_id, width=canvas.winfo_width())
+        def _on_frame(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.bind("<Configure>", _on_resize)
+        body.bind("<Configure>",   _on_frame)
+
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # ── File selector ─────────────────────────────────────────
+        self._section_label(body, "📂  EOD STATUS FILE")
+        file_row = tk.Frame(body, bg=self.BG)
+        file_row.pack(fill="x", pady=(4, 2))
+
+        tk.Entry(file_row, textvariable=self.file_path,
+                 font=("Calibri", 9), relief="solid", bd=1,
+                 state="readonly"
+                 ).pack(side="left", fill="x", expand=True,
+                        ipady=5, padx=(0, 6))
+        tk.Button(file_row, text="Browse…",
+                  bg=self.BTN_BROWSE, fg="white",
+                  font=("Calibri", 9, "bold"), relief="flat",
+                  cursor="hand2",
+                  command=self._browse_file
+                  ).pack(side="left", ipady=5, ipadx=10)
+
+        self.file_status_lbl = tk.Label(
+            body, text="No file loaded",
+            bg=self.BG, fg=self.GREY,
+            font=("Calibri", 8, "italic"))
+        self.file_status_lbl.pack(anchor="w", pady=(2, 6))
+
+        # ── Groups placeholder ────────────────────────────────────
+        self._section_label(body, "📋  GROUPS")
+        self.grp_card = tk.Frame(body, bg=self.BG)
+        self.grp_card.pack(fill="x", pady=(4, 4))
+
+        self.btn_row = tk.Frame(body, bg=self.BG)
+        self.btn_row.pack(fill="x", pady=(0, 8))
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=8)
+
+        send_btn = tk.Button(body, text="  📧  Send Selected Emails",
+                             bg=self.BTN_SEND, fg="white",
+                             font=("Calibri", 12, "bold"), relief="flat",
+                             cursor="hand2", pady=8,
+                             activebackground="#c0301f",
+                             activeforeground="white",
+                             command=self._send_selected)
+        send_btn.pack(fill="x", pady=(0, 10))
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=4)
+        self._section_label(body, "🗒  ACTIVITY LOG")
+
+        self.log_box = tk.Text(body, height=8, state="disabled",
+                               bg="#1e1e2e", fg="#cdd6f4",
+                               font=("Consolas", 8),
+                               relief="flat", bd=0,
+                               insertbackground="white")
+        self.log_box.pack(fill="x", pady=(4, 0))
+        self.log_box.tag_configure("green",  foreground="#3fb950")
+        self.log_box.tag_configure("yellow", foreground="#e3b341")
+        self.log_box.tag_configure("red",    foreground="#f85149")
+        self.log_box.tag_configure("blue",   foreground="#58a6ff")
+        self.log_box.tag_configure("grey",   foreground="#8b949e")
+
+        self._log("Ready. Browse & Load the EOD Status file to begin.",
+                  "grey")
+
+    def _build_group_rows(self):
+        for widget in self.grp_card.winfo_children():
+            widget.destroy()
+        for widget in self.btn_row.winfo_children():
+            widget.destroy()
+
+        self.group_vars        = {g: tk.BooleanVar(value=False) for g in GROUPS}
+        self.status_labels     = {}
+        self.preview_btns      = {}
+        self.attachment_paths  = {g: [] for g in GROUPS}
+        self.attachment_labels = {}
+        self.path_texts        = {}
+        self.question_texts    = {}
+        self.no_activity_confirmed = {g: tk.BooleanVar(value=False) for g in GROUPS}
+        self.no_activity_cbs       = {}
+        self.no_activity_rows      = {}
+        self.group_checkbuttons    = {}
+
+        for group in GROUPS:
+            self._build_group_row(self.grp_card, group)
+
+        tk.Button(self.btn_row, text="✓  Select All",
+                  bg=self.GREY, fg="white",
+                  font=("Calibri", 9, "bold"), relief="flat",
+                  cursor="hand2", command=self._select_all
+                  ).pack(side="left", padx=(0, 6), ipady=4, ipadx=8)
+        tk.Button(self.btn_row, text="✗  Clear All",
+                  bg=self.GREY, fg="white",
+                  font=("Calibri", 9, "bold"), relief="flat",
+                  cursor="hand2", command=self._clear_all
+                  ).pack(side="left", ipady=4, ipadx=8)
+
+    def _build_group_row(self, parent, group):
+        cfg  = GROUPS[group]
+        card = tk.Frame(parent, bg=self.PANEL_BG,
+                        relief="solid", bd=1)
+        card.pack(fill="x", pady=(0, 6))
+
+        top_row = tk.Frame(card, bg=self.PANEL_BG)
+        top_row.pack(fill="x", padx=10, pady=(8, 2))
+
+        chk = tk.Checkbutton(top_row, text=f"  {group}",
+                       variable=self.group_vars[group],
+                       bg=self.PANEL_BG, fg=self.TEXT_DARK,
+                       font=("Calibri", 10, "bold"),
+                       activebackground=self.PANEL_BG,
+                       selectcolor=self.PANEL_BG
+                       )
+        chk.pack(side="left")
+        self.group_checkbuttons[group] = chk
+
+        btn = tk.Button(top_row, text="👁  Preview",
+                        bg=self.BTN_PREVIEW, fg="white",
+                        font=("Calibri", 9), relief="flat",
+                        cursor="hand2", state="disabled",
+                        activebackground="#005fa3",
+                        activeforeground="white",
+                        command=lambda g=group: self._preview(g))
+        btn.pack(side="right", padx=(0, 4), ipady=3, ipadx=6)
+        self.preview_btns[group] = btn
+
+        lbl = tk.Label(top_row, text="— load file first",
+                       bg=self.PANEL_BG, fg=self.GREY,
+                       font=("Calibri", 9, "italic"))
+        lbl.pack(side="left", padx=(6, 0))
+        self.status_labels[group] = lbl
+
+        # ── No-activity confirmation row ────────────────────────
+        # Hidden by default. Shown only when today's sheet has zero
+        # rows for this group — sending a "No Activity" mail then
+        # requires this explicit tick, so a stale/unfilled sheet
+        # can never masquerade as a confirmed no-activity day.
+        na_row = tk.Frame(card, bg="#fff7e6")
+        na_cb = tk.Checkbutton(
+            na_row,
+            text="  ⚠  Confirm: genuinely no activity today — OK to send",
+            variable=self.no_activity_confirmed[group],
+            bg="#fff7e6", fg="#8a5a00",
+            font=("Calibri", 9, "bold"),
+            activebackground="#fff7e6",
+            selectcolor="#fff7e6",
+            command=lambda g=group: self._on_no_activity_confirm(g))
+        na_cb.pack(anchor="w", padx=6, pady=4)
+        self.no_activity_cbs[group]  = na_cb
+        self.no_activity_rows[group] = na_row
+        # not packed here — _set_no_activity_state() shows/hides it
+
+        ttk.Separator(card, orient="horizontal").pack(
+            fill="x", pady=(6, 4))
+
+        # ── Attachments row ───────────────────────────────────────
+        att_row = tk.Frame(card, bg=self.PANEL_BG)
+        att_row.pack(fill="x", pady=(0, 2), padx=10)
+
+        tk.Label(att_row, text="📎 Attach Files:",
+                 bg=self.PANEL_BG, fg=self.TEXT_MID,
+                 font=("Calibri", 9, "bold")
+                 ).pack(side="left", padx=(0, 6))
+        tk.Button(att_row, text="+ Browse",
+                  bg=self.BTN_ATTACH, fg="white",
+                  font=("Calibri", 8), relief="flat",
+                  cursor="hand2",
+                  command=lambda g=group: self._browse_attachments(g)
+                  ).pack(side="left", ipady=2, ipadx=6)
+        tk.Button(att_row, text="✕ Clear",
+                  bg=self.GREY, fg="white",
+                  font=("Calibri", 8), relief="flat",
+                  cursor="hand2",
+                  command=lambda g=group: self._clear_attachments(g)
+                  ).pack(side="left", padx=(4, 0), ipady=2, ipadx=6)
+
+        att_lbl = tk.Label(att_row,
+                           text="  No files attached",
+                           bg=self.PANEL_BG, fg=self.GREY,
+                           font=("Calibri", 8, "italic"),
+                           anchor="w", wraplength=380, justify="left")
+        att_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
+        self.attachment_labels[group] = att_lbl
+
+        # ── Reference paths row ───────────────────────────────────
+        path_row = tk.Frame(card, bg=self.PANEL_BG)
+        path_row.pack(fill="x", pady=(4, 8), padx=10)
+
+        tk.Label(path_row, text="📁 Ref Paths:",
+                 bg=self.PANEL_BG, fg=self.TEXT_MID,
+                 font=("Calibri", 9, "bold")
+                 ).pack(side="left", anchor="n", padx=(0, 6), pady=2)
+
+        pt = tk.Text(path_row, height=2,
+                     font=("Consolas", 8), relief="solid", bd=1,
+                     wrap="none")
+        pt.pack(side="left", fill="x", expand=True)
+        self.path_texts[group] = pt
+
+        # ── Questions / Comments row ───────────────────────────────
+        q_row = tk.Frame(card, bg=self.PANEL_BG)
+        q_row.pack(fill="x", pady=(0, 8), padx=10)
+
+        tk.Label(q_row, text="❓ Questions/Comments\n(to Onshore/Client):",
+                 bg=self.PANEL_BG, fg=self.TEXT_MID,
+                 font=("Calibri", 9, "bold"), justify="left"
+                 ).pack(side="left", anchor="n", padx=(0, 6), pady=2)
+
+        qt = tk.Text(q_row, height=2,
+                     font=("Calibri", 9), relief="solid", bd=1,
+                     wrap="word")
+        qt.pack(side="left", fill="x", expand=True)
+        self.question_texts[group] = qt
+
+    def _section_label(self, parent, text):
+        tk.Label(parent, text=text,
+                 bg=self.BG, fg=self.ACCENT,
+                 font=("Calibri", 9, "bold")
+                 ).pack(anchor="w", pady=(8, 2))
+
+    # ── NO-ACTIVITY CONFIRMATION GATE ───────────────────────────────
+
+    def _on_no_activity_confirm(self, group):
+        """Ticking the confirm box is the only thing that arms the
+        send checkbox for a zero-row group; unticking disarms it."""
+        confirmed = self.no_activity_confirmed[group].get()
+        self.group_vars[group].set(confirmed)
+        self.group_checkbuttons[group].config(
+            state="normal" if confirmed else "disabled")
+        if confirmed:
+            self._log(f"[{group}] No-activity send confirmed by user.",
+                      "blue")
+        else:
+            self._log(f"[{group}] No-activity confirmation withdrawn.",
+                      "yellow")
+
+    def _set_no_activity_state(self, group, is_no_activity):
+        """Show/lock or hide/unlock the no-activity confirmation row.
+        When is_no_activity is True, the send checkbox is forced off
+        and disabled until the user explicitly confirms."""
+        if is_no_activity:
+            self.no_activity_rows[group].pack(
+                fill="x", padx=10, pady=(0, 6))
+            self.no_activity_confirmed[group].set(False)
+            self.group_vars[group].set(False)
+            self.group_checkbuttons[group].config(state="disabled")
+        else:
+            self.no_activity_rows[group].pack_forget()
+            self.no_activity_confirmed[group].set(False)
+            self.group_checkbuttons[group].config(state="normal")
+
+    # ── ATTACHMENT HELPERS ────────────────────────────────────────
+
+    def _browse_attachments(self, group):
+        files = filedialog.askopenfilenames(
+            title=f"Select attachment(s) for {group}",
+            filetypes=[("All Files", "*.*"),
+                       ("Excel", "*.xlsx *.xls"),
+                       ("PDF", "*.pdf"),
+                       ("Word", "*.docx *.doc")]
+        )
+        if files:
+            duplicates = []
+            added      = []
+            for f in files:
+                if f in self.attachment_paths[group]:
+                    duplicates.append(os.path.basename(f))
+                else:
+                    self.attachment_paths[group].append(f)
+                    added.append(os.path.basename(f))
+            if added:
+                self._refresh_attachment_label(group)
+                self._log(f"[{group}] 📎 {len(added)} file(s) added.",
+                          "blue")
+            if duplicates:
+                messagebox.showwarning(
+                    "Duplicate Attachment",
+                    f"Already added for {group} — skipped:\n\n"
+                    + "\n".join(f"  • {d}" for d in duplicates)
+                )
+
+    def _clear_attachments(self, group):
+        self.attachment_paths[group].clear()
+        self._refresh_attachment_label(group)
+        self._log(f"[{group}] Attachments cleared.", "grey")
+
+    def _refresh_attachment_label(self, group):
+        files = self.attachment_paths.get(group, [])
+        if not files:
+            self.attachment_labels[group].config(
+                text="  No files attached", fg=self.GREY)
+        else:
+            names = ",  ".join(os.path.basename(f) for f in files)
+            self.attachment_labels[group].config(
+                text=f"  {names}", fg=self.GREEN)
+
+    def _get_ref_paths(self, group):
+        raw = self.path_texts[group].get("1.0", "end").strip()
+        return [p.strip() for p in raw.splitlines() if p.strip()]
+
+    def _get_questions(self, group):
+        return self.question_texts[group].get("1.0", "end").strip()
+
+    # ── FILE BROWSE & LOAD ────────────────────────────────────────
+
+    def _browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Select EOD Status Excel File",
+            filetypes=[("Excel Files", "*.xlsx *.xls"),
+                       ("All Files", "*.*")]
+        )
+        if path:
+            self.file_path.set(path)
+            self._load_file()
+
+    def _load_file(self):
+        path = self.file_path.get().strip()
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning("Invalid File",
+                                   "Please select a valid Excel file.")
+            return
+
+        ok, reason = check_file_accessible(path)
+        if not ok:
+            messagebox.showerror("File Locked", reason)
+            self.file_status_lbl.config(
+                text="❌  File is locked — close Excel / wait for OneDrive sync",
+                fg=self.RED)
+            self._log(f"File locked: {reason}", "red")
+            return
+
+        self._log(f"Loading: {os.path.basename(path)}", "blue")
+
+        ok, err_msg, groups_cfg, recipients = read_config(path)
+        if not ok:
+            messagebox.showerror("Config Error", err_msg)
+            self.file_status_lbl.config(
+                text="❌  Config error — see details",
+                fg=self.RED)
+            self._log(f"Config error: {err_msg}", "red")
+            return
+
+        self._build_group_rows()
+
+        today     = datetime.date.today()
+        found_any = False
+
+        for group in GROUPS:
+            to_list = recipients.get(group, {}).get("to", [])
+            cc_list = recipients.get(group, {}).get("cc", [])
+
+            if not to_list:
+                self.status_labels[group].config(
+                    text="⚠️  No recipients configured — will be skipped",
+                    fg=self.YELLOW)
+                self.preview_btns[group].config(state="disabled")
+                self._set_no_activity_state(group, False)
+                self.group_vars[group].set(False)
+                self._log(
+                    f"[{group}] ⚠️ No recipients found — auto-unchecked.",
+                    "yellow")
+                continue
+
+            df, err = read_group_data(path, group)
+            sent    = already_sent_today(group)
+
+            if sent:
+                self.status_labels[group].config(
+                    text="✅  Already sent today", fg=self.GREEN)
+                self.preview_btns[group].config(state="normal")
+                self._set_no_activity_state(group, False)
+                self.group_vars[group].set(False)
+                self._log(f"[{group}] Already sent today.", "yellow")
+
+            elif df is None:
+                self.status_labels[group].config(
+                    text=f"❌  Error — {err}", fg=self.RED)
+                self.preview_btns[group].config(state="disabled")
+                self._set_no_activity_state(group, False)
+                self.group_vars[group].set(False)
+                self._log(f"[{group}] ERROR — {err}", "red")
+
+            elif df.empty:
+                self.status_labels[group].config(
+                    text=f"⚠️  No data for today — {err}",
+                    fg=self.YELLOW)
+                self.preview_btns[group].config(state="normal")
+                # ✅ Zero rows today ≠ automatic "no activity" email.
+                # Lock the send checkbox until the tick box below is
+                # explicitly confirmed by a human.
+                self._set_no_activity_state(group, True)
+                self._log(
+                    f"[{group}] No data for today — awaiting manual "
+                    f"'no activity' confirmation before it can send.",
+                    "yellow")
+                found_any = True
+
+            else:
+                self.status_labels[group].config(
+                    text=f"✅  {len(df)} row(s) ready",
+                    fg=self.GREEN)
+                self.preview_btns[group].config(state="normal")
+                self._set_no_activity_state(group, False)
+                self.group_vars[group].set(True)
+                self._log(f"[{group}] {len(df)} row(s) loaded.", "green")
+                found_any = True
+
+        if found_any:
+            self.file_status_lbl.config(
+                text=f"✅  Loaded: {os.path.basename(path)}  "
+                     f"({today.strftime('%d %b %Y')})",
+                fg=self.GREEN)
+        else:
+            self.file_status_lbl.config(
+                text="⚠️  File loaded but no data found for today.",
+                fg=self.YELLOW)
+
+    # ── PREVIEW ───────────────────────────────────────────────────
+
+    def _preview(self, group):
+        import webbrowser, tempfile
+        path = self.file_path.get().strip()
+        if not path:
+            messagebox.showwarning(
+                "No File",
+                "Please browse and load the EOD Status file first.")
+            return
+
+        ok, reason = check_file_accessible(path)
+        if not ok:
+            messagebox.showerror("File Locked", reason)
+            return
+
+        today = datetime.date.today()
+        _, _, _, recipients = read_config(path)
+        to_list = recipients.get(group, {}).get("to", [])
+        cc_list = recipients.get(group, {}).get("cc", [])
+
+        df, err = read_group_data(path, group)
+        if df is None:
+            messagebox.showerror("Error", f"Could not read data:\n{err}")
+            return
+
+        ref_paths = self._get_ref_paths(group)
+        questions = self._get_questions(group)
+        html = (
+            build_html(today, df, group,
+                       to_list=to_list, cc_list=cc_list,
+                       ref_paths=ref_paths, questions=questions)
+            if not df.empty else
+            build_no_data_html(today, group,
+                               to_list=to_list, cc_list=cc_list,
+                               ref_paths=ref_paths, questions=questions)
+        )
+
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".html",
+            prefix=f"EOD_Preview_{group}_",
+            mode="w", encoding="utf-8"
+        )
+        tmp.write(html)
+        tmp.close()
+        webbrowser.open(f"file:///{tmp.name}")
+        self._log(
+            f"[{group}] Preview opened — "
+            f"TO: {len(to_list)}, CC: {len(cc_list)}", "blue")
+
+    # ── SEND ──────────────────────────────────────────────────────
+
+    def _send_selected(self):
+        path = self.file_path.get().strip()
+        if not path:
+            messagebox.showwarning(
+                "No File",
+                "Please browse and load the EOD Status file first.")
+            return
+
+        ok, reason = check_file_accessible(path)
+        if not ok:
+            messagebox.showerror("File Locked", reason)
+            return
+
+        if not GROUPS:
+            messagebox.showwarning(
+                "No Groups",
+                "No groups loaded. Please load the EOD Status file first.")
+            return
+
+        selected = [g for g, v in self.group_vars.items() if v.get()]
+        if not selected:
+            messagebox.showwarning(
+                "Nothing Selected",
+                "Please check at least one group to send.")
+            return
+
+        # ── Validate no-activity confirmations BEFORE confirm ─────
+        # Defensive re-check: even though the UI locks the checkbox,
+        # never let a zero-row group reach Outlook without the
+        # explicit tick — the sheet may simply be unfilled, not
+        # genuinely inactive.
+        unconfirmed_no_activity = []
+        for group in selected:
+            df, _ = read_group_data(path, group)
+            if (df is not None and df.empty and
+                    not self.no_activity_confirmed[group].get()):
+                unconfirmed_no_activity.append(group)
+
+        if unconfirmed_no_activity:
+            messagebox.showerror(
+                "Confirmation Required",
+                "⛔  Cannot send — these groups have zero rows for "
+                "today and have not been confirmed as genuinely "
+                "'no activity':\n\n"
+                + "\n".join(f"  • {g}" for g in unconfirmed_no_activity)
+                + "\n\nTick the confirm box on each group, or update "
+                  "the EOD Status file, then try again."
+            )
+            return
+
+        # ── Validate attachments BEFORE confirm ───────────────────
+        MAX_ATTACHMENT_MB  = 10
+        broken_attachments = []
+        large_attachments  = []
+
+        for group in selected:
+            for fp in self.attachment_paths.get(group, []):
+                if not os.path.exists(fp):
+                    broken_attachments.append(
+                        f"[{group}]  {os.path.basename(fp)} (file not found)")
+                else:
+                    ok_a, _ = check_file_accessible(fp)
+                    if not ok_a:
+                        broken_attachments.append(
+                            f"[{group}]  {os.path.basename(fp)} (locked/in use)")
+                    else:
+                        size_mb = os.path.getsize(fp) / (1024 * 1024)
+                        if size_mb > MAX_ATTACHMENT_MB:
+                            large_attachments.append(
+                                f"[{group}]  {os.path.basename(fp)} "
+                                f"({size_mb:.1f} MB)")
+
+        if broken_attachments:
+            messagebox.showerror(
+                "Attachment Error",
+                "⛔  Cannot send — files missing or locked:\n\n"
+                + "\n".join(f"  • {b}" for b in broken_attachments)
+                + "\n\nPlease fix and try again."
+            )
+            return
+
+        if large_attachments:
+            if not messagebox.askyesno(
+                "Large Attachments",
+                f"⚠️  Files exceed {MAX_ATTACHMENT_MB} MB:\n\n"
+                + "\n".join(f"  • {a}" for a in large_attachments)
+                + "\n\nSend anyway?"
+            ):
+                return
+
+        # ── Confirm dialog ────────────────────────────────────────
+        confirm_lines = []
+        for g in selected:
+            line = f"  •  {g}"
+            atts = self.attachment_paths.get(g, [])
+            refs = self._get_ref_paths(g)
+            qs   = self._get_questions(g)
+            if atts:
+                line += f"\n       📎 {', '.join(os.path.basename(f) for f in atts)}"
+            if refs:
+                line += f"\n       📁 {len(refs)} path(s)"
+            if qs:
+                line += f"\n       ❓ Question/comment to onshore/client included"
+            confirm_lines.append(line)
+
+        if not messagebox.askyesno("Confirm Send", (
+            "You are about to send EOD emails for:\n\n"
+            + "\n".join(confirm_lines)
+            + f"\n\nDate: {datetime.date.today().strftime('%d %b %Y')}"
+            + "\n\nProceed?"
+        )):
+            return
+
+        today   = datetime.date.today()
+        success = []
+        skipped = []
+        failed  = []
+
+        _, _, _, recipients = read_config(path)
+
+        for group in selected:
+            try:
+                self._log(f"[{group}] Preparing…", "blue")
+
+                if already_sent_today(group):
+                    self._log(f"[{group}] Skipped — already sent today.",
+                              "yellow")
+                    continue
+
+                df, err = read_group_data(path, group)
+                if df is None:
+                    raise Exception(err)
+
+                ref_paths   = self._get_ref_paths(group)
+                questions   = self._get_questions(group)
+                attachments = self.attachment_paths.get(group, [])
+
+                html = (build_html(today, df, group, ref_paths=ref_paths,
+                                   questions=questions)
+                        if not df.empty
+                        else build_no_data_html(today, group,
+                                                ref_paths=ref_paths,
+                                                questions=questions))
+
+                to_list = recipients.get(group, {}).get("to", [])
+                cc_list = recipients.get(group, {}).get("cc", [])
+
+                if not to_list:
+                    self._log(f"[{group}] ⚠️ Skipped — no recipients.",
+                              "yellow")
+                    self.status_labels[group].config(
+                        text="⚠️  Skipped — no recipients",
+                        fg=self.YELLOW)
+                    skipped.append(group)
+                    continue
+
+                send_outlook_email(
+                    html, group, today, to_list, cc_list,
+                    attachments=attachments,
+                    ref_paths=ref_paths)
+
+                write_audit_log(group, today.strftime("%Y-%m-%d"))
+
+                self.status_labels[group].config(
+                    text="✅  Sent just now!", fg=self.GREEN)
+                self.group_vars[group].set(False)
+                self._set_no_activity_state(group, False)
+                success.append(group)
+
+                self.attachment_paths[group].clear()
+                self._refresh_attachment_label(group)
+                self.path_texts[group].delete("1.0", "end")
+                self.question_texts[group].delete("1.0", "end")
+
+                self._log(
+                    f"[{group}] ✅ Sent! "
+                    f"(📎 {len(attachments)} attachment(s), "
+                    f"📁 {len(ref_paths)} path(s))", "green")
+
+            except Exception as e:
+                failed.append(group)
+                self._log(f"[{group}] ❌ FAILED — {e}", "red")
+                log_message(traceback.format_exc())
+
+        msg = ""
+        if success:
+            msg += "✅  Sent:\n" + "\n".join(f"  • {g}" for g in success)
+        if skipped:
+            msg += ("\n\n" if msg else "") + \
+                   "⚠️  Skipped:\n" + \
+                   "\n".join(f"  • {g}" for g in skipped)
+        if failed:
+            msg += ("\n\n" if msg else "") + \
+                   "❌  Failed:\n" + \
+                   "\n".join(f"  • {g}" for g in failed)
+        if msg:
+            messagebox.showinfo("Send Complete", msg.strip())
+
+    # ── HELPERS ───────────────────────────────────────────────────
+
+    def _select_all(self):
+        for v in self.group_vars.values(): v.set(True)
+
+    def _clear_all(self):
+        for v in self.group_vars.values(): v.set(False)
+
+    def _log(self, message, tag="grey"):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_box.config(state="normal")
+        self.log_box.insert("end", f"[{ts}]  {message}\n", tag)
+        self.log_box.see("end")
+        self.log_box.config(state="disabled")
+        log_message(message)
+
+    def _center_window(self):
+        self.root.update_idletasks()
+        w  = self.root.winfo_width()
+        h  = self.root.winfo_height()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+
+# ========================== ENTRY POINT ============================
+
+if __name__ == "__main__":
+
+    # ✅ root MUST be created first — tkinter variables need a root
+    root = tk.Tk()
+    root.withdraw()         # hide main window while splash shows
+
+    # ✅ Splash uses Toplevel (child of root) — not a second Tk()
+    splash = tk.Toplevel(root)
+    splash.overrideredirect(True)
+    splash.configure(bg="#003865")
+    splash.attributes("-topmost", True)
+    sw = splash.winfo_screenwidth()
+    sh = splash.winfo_screenheight()
+    w, h = 420, 130
+    splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    tk.Label(splash,
+             text="Alter Domus  ·  Starting up, please wait...",
+             bg="#003865", fg="#90b8d8",
+             font=("Calibri", 9)).pack()
+
+    status_lbl = tk.Label(splash, text="Initialising...",
+                          bg="#003865", fg="#5a8fa8",
+                          font=("Calibri", 8))
+    status_lbl.pack(pady=(4, 0))
+
+    splash.update()  #
+
+    status_lbl.config(text="Building interface...")
+    splash.update()
+
+    app = EODDispatcherApp(root)
+
+    status_lbl.config(text="Almost ready...")
+    splash.update()
+
+    splash.destroy()
+    root.deiconify()
+    root.mainloop()
